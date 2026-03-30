@@ -183,6 +183,135 @@ Once running, you'll see a split-pane Textual TUI with three panels:
 | `credentials.json` | Your OAuth credentials **(do not commit!)** |
 | `token.json` | Auto-generated auth token **(do not commit!)** |
 
+## Architecture
+
+Gmail Manager uses a **hybrid protocol model** — combining the Gmail REST API, IMAP with XOAUTH2, and the Drive API — each chosen for what it does best.
+
+### Why Hybrid?
+
+| Need | Protocol | Reason |
+|------|----------|--------|
+| Global mailbox stats | **Gmail REST API** | Fast label metadata, no folder enumeration needed |
+| Per-year email counts | **IMAP** | Gmail REST API caps `resultSizeEstimate` at ~501; IMAP `SEARCH` returns exact counts |
+| Per-year category breakdown | **IMAP** | `X-GM-RAW` queries on IMAP support Gmail search syntax within specific folders |
+| Trash/Spam counts by year | **IMAP** | Must select locale-specific folders (`\Trash`, `\Junk` attributes); REST labels don't support year-scoped counts |
+| Bulk move/delete emails | **Gmail REST API** | `batchModify` handles up to 1000 messages per call |
+| Storage quota | **Drive API v3** | Gmail API doesn't expose account storage; Drive's `about.get` does |
+
+### High-Level Component Diagram
+
+```mermaid
+graph TB
+    TUI["<b>Gmail Manager TUI</b><br/>(Textual App)"]
+
+    subgraph auth["auth.py — Authentication"]
+        AUTH["authenticate()<br/><i>→ Gmail Service object</i>"]
+        CREDS["get_credentials()<br/><i>→ raw OAuth2 Credentials</i>"]
+    end
+
+    subgraph ops["gmail_ops.py — Operations"]
+        direction TB
+        REST["<b>Gmail REST API</b><br/>get_email_stats()<br/>_batch_trash_messages()<br/>trash_* functions<br/>permanently_delete_trash()"]
+        IMAP["<b>IMAP + XOAUTH2</b><br/>_connect_imap()<br/>get_yearly_breakdown_imap()<br/>get_year_category_stats_imap()"]
+        DRIVE["<b>Drive API v3</b><br/>get_storage_quota()"]
+    end
+
+    subgraph google["Google Services"]
+        GMAIL_API["Gmail API v1<br/>REST endpoints"]
+        IMAP_SRV["imap.gmail.com<br/>IMAP4_SSL + XOAUTH2"]
+        DRIVE_API["Drive API v3<br/>about.get"]
+    end
+
+    TUI --> AUTH
+    TUI --> CREDS
+    AUTH --> REST
+    CREDS --> IMAP
+    CREDS --> DRIVE
+    REST --> GMAIL_API
+    IMAP --> IMAP_SRV
+    DRIVE --> DRIVE_API
+```
+
+### Protocol Flow — Statistics vs Actions
+
+```mermaid
+flowchart LR
+    subgraph stats["📊 Statistics (Read)"]
+        direction TB
+        S1["Global stats<br/><i>REST API: labels.get</i>"]
+        S2["Yearly breakdown<br/><i>IMAP: SEARCH SINCE/BEFORE</i>"]
+        S3["Year category stats<br/><i>IMAP: X-GM-RAW queries</i>"]
+        S4["Storage quota<br/><i>Drive API: about.get</i>"]
+    end
+
+    subgraph actions["⚡ Actions (Write)"]
+        direction TB
+        A1["Trash emails<br/><i>REST API: batchModify<br/>up to 1000 IDs/call</i>"]
+        A2["Delete spam<br/><i>REST API: messages.delete<br/>(permanent)</i>"]
+        A3["Empty trash<br/><i>REST API: messages.delete<br/>(permanent)</i>"]
+    end
+
+    subgraph refresh["🔄 Post-Action Refresh"]
+        direction TB
+        R1[REST API → global stats]
+        R2[IMAP → yearly stats]
+        R3[Drive API → quota]
+    end
+
+    actions --> refresh
+```
+
+### XOAUTH2 Authentication Flow
+
+```mermaid
+sequenceDiagram
+    participant App as Gmail Manager
+    participant Auth as auth.py
+    participant Google as Google OAuth
+    participant GMAIL as Gmail REST API
+    participant IMAP as imap.gmail.com
+    participant Drive as Drive API v3
+
+    Note over App,Drive: First Run — OAuth2 Authorization
+    App->>Auth: authenticate()
+    Auth->>Google: InstalledAppFlow (browser consent)
+    Google-->>Auth: Access Token + Refresh Token
+    Auth-->>App: Gmail Service object
+    App->>Auth: get_credentials()
+    Auth-->>App: Raw Credentials (token)
+
+    Note over App,Drive: IMAP Connection via XOAUTH2
+    App->>GMAIL: GET /users/me/profile (get email address)
+    GMAIL-->>App: emailAddress
+    App->>IMAP: IMAP4_SSL connect
+    App->>IMAP: AUTHENTICATE XOAUTH2<br/>user={email} auth=Bearer {token}
+    IMAP-->>App: OK (authenticated)
+    App->>IMAP: LIST (discover folders by attributes)
+    IMAP-->>App: Folder list with \Trash, \Junk flags
+    App->>IMAP: SELECT "[Gmail]/All Mail"
+    App->>IMAP: SEARCH X-GM-RAW "after:2024/1/1 before:2025/1/1"
+    IMAP-->>App: Message count
+
+    Note over App,Drive: Drive API for Storage Quota
+    App->>Drive: about.get(fields="storageQuota")
+    Drive-->>App: used / total bytes
+```
+
+### Function → Protocol Map
+
+| Module | Function | Protocol |
+|--------|----------|----------|
+| auth.py | `authenticate()` | OAuth2 → Gmail REST service |
+| auth.py | `get_credentials()` | OAuth2 → raw credentials |
+| gmail_ops.py | `get_email_stats()` | Gmail REST API |
+| gmail_ops.py | `get_yearly_breakdown_imap()` | IMAP (SEARCH SINCE/BEFORE) |
+| gmail_ops.py | `get_year_category_stats_imap()` | IMAP (X-GM-RAW + folder discovery) |
+| gmail_ops.py | `get_storage_quota()` | Drive API v3 |
+| gmail_ops.py | `_batch_trash_messages()` | Gmail REST API (batchModify) |
+| gmail_ops.py | `trash_*()` (all variants) | Gmail REST API |
+| gmail_ops.py | `permanently_delete_trash()` | Gmail REST API (messages.delete) |
+| gmail_ops.py | `_connect_imap()` | IMAP + REST API (profile lookup) |
+
 ## Security
 
 The `.gitignore` is configured to prevent committing sensitive files:
