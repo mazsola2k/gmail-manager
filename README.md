@@ -2,6 +2,8 @@
 
 A terminal-based Gmail manager that shows your mailbox statistics and helps you clean up emails.
 
+![alt text](image.png)
+
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue)
 
 ## Features
