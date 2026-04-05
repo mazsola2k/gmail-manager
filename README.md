@@ -13,6 +13,7 @@ A terminal-based Gmail manager that shows your mailbox statistics and helps you 
 - **Yearly breakdown** — visualize email volume by year with bar charts
 - **Year drill-down** — select a year to see per-category stats for that year
 - **Year-scoped actions** — all cleanup actions can target a specific year
+- **Google Drive folders** — list root-level Drive folders sorted by size with visual bars, archive or trash folders
 - **Smart suggestions** — get cleanup recommendations based on your mailbox
 - **Cleanup actions:**
   - 🗑 Permanently delete spam
@@ -24,6 +25,10 @@ A terminal-based Gmail manager that shows your mailbox statistics and helps you 
   - ⏰ Trash emails older than N days
   - 📦 Trash large emails (>10MB)
   - 🔥 Empty trash (permanently delete trashed emails)
+- **Drive folder actions:**
+  - 📁 Browse root folders sorted by total size (descending)
+  - 🗑 Trash a folder
+  - 📦 Archive a folder (moves into an "Archive" folder in Drive root)
 
 ## Prerequisites
 
@@ -75,7 +80,7 @@ The Drive API is used to display your Google account storage quota (used / total
 4. Click **Save and Continue**
 5. On the **Scopes** page, click **Add or Remove Scopes**
    - Search for `https://mail.google.com/` and check it
-   - Also search for `https://www.googleapis.com/auth/drive.metadata.readonly` and check it
+   - Also search for `https://www.googleapis.com/auth/drive` and check it
    - Click **Update** at the bottom
    - Click **Save and Continue**
 6. On the **Test users** page:
@@ -127,13 +132,13 @@ python gmail_manager.py
 1. A browser window will open automatically showing Google's consent page
 2. Select the Google account you want to manage
 3. You may see a warning **"Google hasn't verified this app"** — click **Continue** (this is your own app)
-4. Grant the requested permissions (Gmail access and Drive storage read-only)
+4. Grant the requested permissions (Gmail access and Google Drive access)
 5. The browser will show "The authentication flow has completed" — you can close it
 6. Back in the terminal, the app will load and display your mailbox statistics
 
 A `token.json` file is saved locally so you won't need to re-authorize on future runs. If you revoke access or the token expires, simply delete `token.json` and run again.
 
-> **Note:** If you previously authorized without the Drive API scope and later enable it, delete `token.json` and re-run the app to authorize with the updated scopes.
+> **Note:** If you previously authorized without the full Drive API scope (e.g., only `drive.metadata.readonly`), delete `token.json` and re-run the app to authorize with the updated scopes. The app will detect stale scopes and prompt re-authentication automatically.
 
 ## Usage
 
@@ -152,6 +157,7 @@ Once running, you'll see a split-pane Textual TUI with three panels:
 - **Navigation:**
   - Use **arrow keys** or **mouse** to navigate panels and select items
   - Press **Tab** to switch between panels
+  - Press **D** to open the Google Drive folder browser
   - Every destructive action shows a confirmation dialog with clickable **Yes/No** buttons (or keyboard **Y/N**)
   - Press **Q** to quit
 
@@ -179,8 +185,7 @@ Once running, you'll see a split-pane Textual TUI with three panels:
 |------|---------|
 | `gmail_manager.py` | Main TUI application |
 | `auth.py` | OAuth2 authentication |
-| `gmail_ops.py` | Gmail API operations |
-| `credentials.json` | Your OAuth credentials **(do not commit!)** |
+| `gmail_ops.py` | Gmail API operations || `drive_ops.py` | Google Drive API operations || `credentials.json` | Your OAuth credentials **(do not commit!)** |
 | `token.json` | Auto-generated auth token **(do not commit!)** |
 
 ## Architecture
@@ -197,6 +202,8 @@ Gmail Manager uses a **hybrid protocol model** — combining the Gmail REST API,
 | Trash/Spam counts by year | **IMAP** | Must select locale-specific folders (`\Trash`, `\Junk` attributes); REST labels don't support year-scoped counts |
 | Bulk move/delete emails | **Gmail REST API** | `batchModify` handles up to 1000 messages per call |
 | Storage quota | **Drive API v3** | Gmail API doesn't expose account storage; Drive's `about.get` does |
+| Drive folder sizes | **Drive API v3** | `files.list` fetches all files; sizes computed via in-memory parent tree |
+| Trash/archive folders | **Drive API v3** | `files.update` to trash or reparent folders |
 
 ### High-Level Component Diagram
 

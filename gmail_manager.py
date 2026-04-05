@@ -42,6 +42,13 @@ from gmail_ops import (
     permanently_delete_trash,
     count_messages_by_query,
 )
+from drive_ops import (
+    DriveTree,
+    get_root_folders_with_sizes,
+    trash_drive_folder,
+    archive_drive_folder,
+    format_size,
+)
 
 
 # ── Confirm dialog ────────────────────────────────────────────────────────
@@ -338,8 +345,8 @@ class StatusBar(Static):
         self.update(msg)
 
 
-# ── Action menu ───────────────────────────────────────────────────────────
-ACTIONS = [
+# ── Action menus ──────────────────────────────────────────────────────────
+EMAIL_ACTIONS = [
     ("📊", "Refresh statistics",             "refresh"),
     ("─",  "─────────────────────────────",  "_sep1"),
     ("🗑 ", "Delete spam (permanent)",        "spam"),
@@ -353,13 +360,24 @@ ACTIONS = [
     ("📦", "Trash large emails (>10 MB)",    "large"),
     ("─",  "─────────────────────────────",  "_sep3"),
     ("🔥", "Empty trash (permanent)",        "empty_trash"),
-    ("─",  "─────────────────────────────",  "_sep4"),
-    ("🚪", "Exit",                           "exit"),
 ]
+
+DRIVE_ACTIONS = [
+    ("🔄", "Refresh Drive",                  "drive_refresh"),
+    ("─",  "─────────────────────────────",  "_sep1"),
+    ("📂", "Open folder",                    "drive_open"),
+    ("⬆ ", "Go up",                          "drive_up"),
+    ("─",  "─────────────────────────────",  "_sep2"),
+    ("🗑 ", "Trash folder",                   "drive_trash"),
+    ("📦", "Archive folder",                 "drive_archive"),
+]
+
+# Keep for _update_action_labels compatibility
+ACTIONS = EMAIL_ACTIONS
 
 
 class ActionMenu(Static):
-    """The action menu using ListView for keyboard navigation."""
+    """A reusable action menu using ListView for keyboard navigation."""
 
     DEFAULT_CSS = """
     ActionMenu {
@@ -386,15 +404,429 @@ class ActionMenu(Static):
     }
     """
 
+    def __init__(self, actions: list, list_id: str = "action-list", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._actions = actions
+        self._list_id = list_id
+
     def compose(self) -> ComposeResult:
         items = []
-        for icon, label, action in ACTIONS:
+        for icon, label, action in self._actions:
             if action.startswith("_sep"):
                 item = ListItem(Label(f"  {icon} {label}"), classes="separator", disabled=True)
             else:
                 item = ListItem(Label(f"  {icon}  {label}"), name=action)
             items.append(item)
-        yield ListView(*items, id="action-list")
+        yield ListView(*items, id=self._list_id)
+
+
+# ── Drive panel (inline on main screen) ───────────────────────────────────
+class DrivePanel(Static):
+    """Inline Google Drive folder browser panel."""
+
+    DEFAULT_CSS = """
+    DrivePanel {
+        height: auto;
+        margin: 0 1;
+    }
+    DrivePanel DataTable {
+        height: auto;
+        max-height: 24;
+    }
+    DrivePanel #drive-inline-breadcrumb {
+        height: 1;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    DrivePanel #drive-inline-status {
+        height: 1;
+        color: $text-muted;
+        text-align: center;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.drive_tree: DriveTree | None = None
+        self.folders: list[dict] = []
+        self.nav_stack: list[tuple[str, str]] = []
+
+    def compose(self) -> ComposeResult:
+        yield Label("\U0001f4c2 Root", id="drive-inline-breadcrumb")
+        yield DataTable(id="drive-inline-table")
+        yield Label("Loading Drive folders...", id="drive-inline-status")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#drive-inline-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Google Drive", key="col")
+
+    def set_status(self, msg: str) -> None:
+        self.query_one("#drive-inline-status").update(msg)
+
+    def update_breadcrumb(self) -> None:
+        parts = ["\U0001f4c2 Root"]
+        for _, name in self.nav_stack:
+            parts.append(name)
+        self.query_one("#drive-inline-breadcrumb").update(" \u203a ".join(parts))
+
+    def display_folders(self) -> None:
+        table = self.query_one("#drive-inline-table", DataTable)
+        table.clear()
+        self.update_breadcrumb()
+
+        if self.nav_stack:
+            table.add_row("\u2b06  .. (go up)", key="__go_up__")
+
+        if not self.folders:
+            self.set_status("No subfolders found")
+            return
+
+        total_size = sum(f["size"] for f in self.folders) or 1
+        max_size = max((f["size"] for f in self.folders), default=1) or 1
+        NAME_W = 22
+        for f in self.folders:
+            bar_len = int((f["size"] / max_size) * 10) if max_size > 0 else 0
+            bar = "\u2588" * bar_len + "\u2591" * (10 - bar_len)
+            pct = f["size"] / total_size * 100
+            if f.get("is_file"):
+                icon = "\U0001f4c4"
+            elif f.get("has_subfolders"):
+                icon = "\U0001f4c2"
+            else:
+                icon = "\U0001f4c1"
+            short = f['name'][:NAME_W].ljust(NAME_W)
+            label = f"{icon} {short} {f['size_formatted']:>9s} {bar} {pct:4.1f}%"
+            table.add_row(label, key=f["id"])
+
+        folder_count = sum(1 for f in self.folders if not f.get("is_file"))
+        file_count = sum(1 for f in self.folders if f.get("is_file"))
+        parts = []
+        if folder_count:
+            parts.append(f"{folder_count} folders")
+        if file_count:
+            parts.append(f"{file_count} files")
+        self.set_status(f"{', '.join(parts)} \u2014 Total: {format_size(total_size)}")
+
+    def get_selected_item(self) -> tuple:
+        table = self.query_one("#drive-inline-table", DataTable)
+        if table.row_count == 0:
+            return None, None, False
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+            item_id = str(row_key.value)
+            if item_id == "__go_up__":
+                return "__go_up__", None, False
+            for f in self.folders:
+                if f["id"] == item_id:
+                    return item_id, f["name"], f.get("is_file", False)
+        except Exception:
+            pass
+        return None, None, False
+
+    # Keep old name for compatibility
+    def get_selected_folder(self) -> tuple:
+        item_id, name, is_file = self.get_selected_item()
+        return item_id, name
+
+    def navigate_to(self, folder_id: str, folder_name: str) -> None:
+        if not self.drive_tree:
+            return
+        self.nav_stack.append((folder_id, folder_name))
+        self.folders = self.drive_tree.get_children(folder_id)
+        self.display_folders()
+
+    def navigate_up(self) -> None:
+        if not self.drive_tree or not self.nav_stack:
+            return
+        self.nav_stack.pop()
+        parent_id = self.nav_stack[-1][0] if self.nav_stack else None
+        self.folders = self.drive_tree.get_children(parent_id)
+        self.display_folders()
+
+
+# ── Drive folder browser (modal, kept for full-screen) ────────────────────
+class DriveScreen(ModalScreen):
+    """Full-screen modal for browsing Google Drive folders by size with drill-down."""
+
+    BINDINGS = [
+        Binding("escape", "go_back", "Back/Close"),
+        Binding("enter", "open_folder", "Open"),
+        Binding("t", "trash_selected", "Trash"),
+        Binding("a", "archive_selected", "Archive"),
+        Binding("r", "refresh_drive", "Refresh"),
+    ]
+
+    DEFAULT_CSS = """
+    DriveScreen {
+        align: center middle;
+    }
+    #drive-container {
+        width: 90%;
+        height: 90%;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #drive-title {
+        text-align: center;
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #drive-breadcrumb {
+        height: 1;
+        color: $text-muted;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    #drive-table {
+        height: 1fr;
+    }
+    #drive-actions {
+        height: auto;
+        align: center middle;
+        margin-top: 1;
+    }
+    #drive-actions Button {
+        margin: 0 1;
+    }
+    #drive-status {
+        height: 1;
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.drive_tree: DriveTree | None = None
+        self.folders: list[dict] = []
+        # Navigation stack: list of (folder_id, folder_name) tuples
+        # None = root level
+        self.nav_stack: list[tuple[str, str]] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="drive-container"):
+            yield Label("📁 Google Drive — Folders by Size", id="drive-title")
+            yield Label("📂 Root", id="drive-breadcrumb")
+            yield DataTable(id="drive-table")
+            yield Label("Loading folders...", id="drive-status")
+            with Horizontal(id="drive-actions"):
+                yield Button("📂 Open [Enter]", variant="success", id="btn-drive-open")
+                yield Button("🗑  Trash [T]", variant="error", id="btn-drive-trash")
+                yield Button("📦 Archive [A]", variant="warning", id="btn-drive-archive")
+                yield Button("🔄 Refresh [R]", variant="default", id="btn-drive-refresh")
+                yield Button("← Back [Esc]", variant="primary", id="btn-drive-back")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#drive-table", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Google Drive", key="col")
+        self.load_tree()
+
+    @work(thread=True)
+    def load_tree(self) -> None:
+        self.app.call_from_thread(self._set_status, "Loading Drive file tree (this may take a moment)...")
+        try:
+            creds = get_credentials()
+            self.drive_tree = DriveTree(creds)
+            self.nav_stack = []
+            self.folders = self.drive_tree.get_children()
+        except Exception as e:
+            self.app.call_from_thread(self._set_status, f"❌ Error: {e}")
+            return
+        self.app.call_from_thread(self._display_folders)
+
+    @property
+    def current_folder_id(self) -> str | None:
+        """The folder ID we're currently viewing, or None for root."""
+        return self.nav_stack[-1][0] if self.nav_stack else None
+
+    def _set_status(self, msg: str) -> None:
+        self.query_one("#drive-status").update(msg)
+
+    def _update_breadcrumb(self) -> None:
+        parts = ["📂 Root"]
+        for _, name in self.nav_stack:
+            parts.append(name)
+        crumb = " › ".join(parts)
+        self.query_one("#drive-breadcrumb").update(crumb)
+
+    def _display_folders(self) -> None:
+        table = self.query_one("#drive-table", DataTable)
+        table.clear()
+        self._update_breadcrumb()
+
+        # Add ".. (go up)" row if we're inside a subfolder
+        if self.nav_stack:
+            table.add_row("⬆  .. (go up)", key="__go_up__")
+
+        if not self.folders:
+            self._set_status("No subfolders found")
+            return
+
+        total_size = sum(f["size"] for f in self.folders) or 1
+        max_size = max((f["size"] for f in self.folders), default=1) or 1
+        NAME_W = 30
+        for f in self.folders:
+            bar_len = int((f["size"] / max_size) * 15) if max_size > 0 else 0
+            bar = "█" * bar_len + "░" * (15 - bar_len)
+            pct = f["size"] / total_size * 100
+            if f.get("is_file"):
+                icon = "📄"
+            elif f.get("has_subfolders"):
+                icon = "📂"
+            else:
+                icon = "📁"
+            short = f['name'][:NAME_W].ljust(NAME_W)
+            label = f"{icon} {short} {f['size_formatted']:>9s} {bar} {pct:4.1f}%"
+            table.add_row(label, key=f["id"])
+
+        folder_count = sum(1 for f in self.folders if not f.get("is_file"))
+        file_count = sum(1 for f in self.folders if f.get("is_file"))
+        parts = []
+        if folder_count:
+            parts.append(f"{folder_count} folders")
+        if file_count:
+            parts.append(f"{file_count} files")
+        self._set_status(
+            f"{', '.join(parts)} — Total: {format_size(total_size)}"
+        )
+
+    def _get_selected_folder(self) -> tuple:
+        table = self.query_one("#drive-table", DataTable)
+        if table.row_count == 0:
+            return None, None
+        try:
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+            folder_id = str(row_key.value)
+            if folder_id == "__go_up__":
+                return "__go_up__", None
+            for f in self.folders:
+                if f["id"] == folder_id:
+                    return folder_id, f["name"]
+        except Exception:
+            pass
+        return None, None
+
+    def _navigate_to(self, folder_id: str, folder_name: str) -> None:
+        """Drill down into a subfolder."""
+        if not self.drive_tree:
+            return
+        self.nav_stack.append((folder_id, folder_name))
+        self.folders = self.drive_tree.get_children(folder_id)
+        self._display_folders()
+
+    def _navigate_up(self) -> None:
+        """Go up one level."""
+        if not self.drive_tree or not self.nav_stack:
+            return
+        self.nav_stack.pop()
+        parent_id = self.nav_stack[-1][0] if self.nav_stack else None
+        self.folders = self.drive_tree.get_children(parent_id)
+        self._display_folders()
+
+    # ── Actions ───────────────────────────────────────────────────
+    def action_go_back(self) -> None:
+        if self.nav_stack:
+            self._navigate_up()
+        else:
+            self.dismiss(None)
+
+    def action_open_folder(self) -> None:
+        folder_id, name = self._get_selected_folder()
+        if folder_id == "__go_up__":
+            self._navigate_up()
+        elif folder_id and name:
+            item = next((f for f in self.folders if f["id"] == folder_id), None)
+            if item and item.get("is_file"):
+                self._set_status(f"📄 '{name}' is a file — use Trash/Archive actions")
+            else:
+                self._navigate_to(folder_id, name)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "drive-table":
+            return
+        row_key = str(event.row_key.value)
+        if row_key == "__go_up__":
+            self._navigate_up()
+            return
+        for f in self.folders:
+            if f["id"] == row_key:
+                if f.get("is_file"):
+                    self._set_status(f"📄 '{f['name']}' is a file — use Trash/Archive actions")
+                else:
+                    self._navigate_to(row_key, f["name"])
+                return
+
+    def action_trash_selected(self) -> None:
+        folder_id, name = self._get_selected_folder()
+        if not folder_id or folder_id == "__go_up__":
+            self._set_status("Select an item first")
+            return
+        item = next((f for f in self.folders if f["id"] == folder_id), None)
+        kind = "file" if item and item.get("is_file") else "folder"
+        size = item["size_formatted"] if item else ""
+        self.app.push_screen(
+            ConfirmDialog(f"🗑  Move {kind} '{name}' ({size}) to trash?"),
+            lambda result, fid=folder_id, fn=name: self._do_trash(fid, fn) if result else None,
+        )
+
+    def action_archive_selected(self) -> None:
+        folder_id, name = self._get_selected_folder()
+        if not folder_id or folder_id == "__go_up__":
+            self._set_status("Select an item first")
+            return
+        item = next((f for f in self.folders if f["id"] == folder_id), None)
+        kind = "file" if item and item.get("is_file") else "folder"
+        size = item["size_formatted"] if item else ""
+        self.app.push_screen(
+            ConfirmDialog(f"📦 Archive {kind} '{name}' ({size})? Moves to Archive folder."),
+            lambda result, fid=folder_id, fn=name: self._do_archive(fid, fn) if result else None,
+        )
+
+    def action_refresh_drive(self) -> None:
+        self.load_tree()
+
+    @work(thread=True)
+    def _do_trash(self, folder_id: str, name: str) -> None:
+        self.app.call_from_thread(self._set_status, f"Trashing '{name}'...")
+        try:
+            creds = get_credentials()
+            trash_drive_folder(creds, folder_id)
+            self.folders = [f for f in self.folders if f["id"] != folder_id]
+            self.app.call_from_thread(self._display_folders)
+            self.app.call_from_thread(self._set_status, f"✅ '{name}' moved to trash")
+        except Exception as e:
+            self.app.call_from_thread(self._set_status, f"❌ Failed: {e}")
+
+    @work(thread=True)
+    def _do_archive(self, folder_id: str, name: str) -> None:
+        self.app.call_from_thread(self._set_status, f"Archiving '{name}'...")
+        try:
+            creds = get_credentials()
+            archive_drive_folder(creds, folder_id)
+            self.folders = [f for f in self.folders if f["id"] != folder_id]
+            self.app.call_from_thread(self._display_folders)
+            self.app.call_from_thread(self._set_status, f"✅ '{name}' archived")
+        except Exception as e:
+            self.app.call_from_thread(self._set_status, f"❌ Failed: {e}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-drive-open":
+            self.action_open_folder()
+        elif event.button.id == "btn-drive-trash":
+            self.action_trash_selected()
+        elif event.button.id == "btn-drive-archive":
+            self.action_archive_selected()
+        elif event.button.id == "btn-drive-refresh":
+            self.action_refresh_drive()
+        elif event.button.id == "btn-drive-back":
+            self.action_go_back()
 
 
 # ── Main App ──────────────────────────────────────────────────────────────
@@ -414,18 +846,18 @@ class GmailManagerApp(App):
     }
 
     #left-pane {
-        width: 2fr;
+        width: 1fr;
         min-width: 50;
         padding: 1;
     }
 
     #right-pane {
         width: 1fr;
-        min-width: 32;
+        min-width: 50;
         padding: 1;
     }
 
-    #stats-title, #actions-title, #yearly-title {
+    #stats-title, #email-actions-title, #yearly-title, #drive-title-main, #drive-actions-title {
         text-align: center;
         text-style: bold;
         color: $accent;
@@ -451,6 +883,7 @@ class GmailManagerApp(App):
         Binding("q", "quit_app", "Quit", show=True),
         Binding("r", "refresh", "Refresh", show=True),
         Binding("y", "yearly", "Yearly", show=True),
+        Binding("d", "drive", "Drive", show=True),
     ]
 
     def __init__(self) -> None:
@@ -470,9 +903,13 @@ class GmailManagerApp(App):
                 yield Label("📅 Emails by Year  [dim](select a year for details)[/dim]", id="yearly-title")
                 yield YearlyPanel(id="yearly-panel")
                 yield SuggestionsPanel(id="suggestions")
+                yield Label("⚡ Email Actions", id="email-actions-title")
+                yield ActionMenu(EMAIL_ACTIONS, "email-action-list", id="email-action-menu")
             with VerticalScroll(id="right-pane"):
-                yield Label("⚡ Actions", id="actions-title")
-                yield ActionMenu(id="action-menu")
+                yield Label("💿 Google Drive Folders", id="drive-title-main")
+                yield DrivePanel(id="drive-panel")
+                yield Label("⚡ Drive Actions", id="drive-actions-title")
+                yield ActionMenu(DRIVE_ACTIONS, "drive-action-list", id="drive-action-menu")
         yield StatusBar(id="status")
         yield Footer()
 
@@ -514,6 +951,23 @@ class GmailManagerApp(App):
             self.yearly = {}
             self.call_from_thread(self.status_msg, f"⚠️ Yearly load failed: {e}")
         self.call_from_thread(self._update_yearly_display)
+        # Auto-load Drive folders
+        self.call_from_thread(self.status_msg, "Loading Google Drive folders...")
+        self._load_drive_inline()
+
+    def _load_drive_inline(self) -> None:
+        """Load Drive data into the inline panel. Called from worker thread."""
+        panel = self.query_one("#drive-panel", DrivePanel)
+        try:
+            creds = get_credentials()
+            panel.drive_tree = DriveTree(creds)
+            panel.nav_stack = []
+            panel.folders = panel.drive_tree.get_children()
+        except Exception as e:
+            self.call_from_thread(panel.set_status, f"❌ Drive error: {e}")
+            return
+        self.call_from_thread(panel.display_folders)
+        self.call_from_thread(self.status_msg, "Ready — select an action from the menu →")
 
     def _update_display(self) -> None:
         self.query_one("#stats-panel", StatsPanel).update_stats(self.stats)
@@ -563,19 +1017,43 @@ class GmailManagerApp(App):
         """Update action menu labels to reflect selected year."""
         year = self.selected_year
         suffix = f" ({year})" if year else ""
-        lv = self.query_one("#action-list", ListView)
+        lv = self.query_one("#email-action-list", ListView)
         for item in lv.children:
             action = getattr(item, "name", None)
-            if not action or action.startswith("_sep") or action in ("exit", "refresh"):
+            if not action or action.startswith("_sep") or action in ("refresh",):
                 continue
-            for icon, base_label, act in ACTIONS:
+            for icon, base_label, act in EMAIL_ACTIONS:
                 if act == action:
                     item.query_one(Label).update(f"  {icon}  {base_label}{suffix}")
                     break
 
-    # ── Yearly table row selection ──────────────────────────────────
+    # ── Drive inline panel interactions ─────────────────────────────
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Update drive action labels when cursor moves to a file vs folder."""
+        if event.data_table.id != "drive-inline-table":
+            return
+        panel = self.query_one("#drive-panel", DrivePanel)
+        _, _, is_file = panel.get_selected_item()
+        kind = "file" if is_file else "folder"
+        try:
+            menu = self.query_one("#drive-action-menu", ActionMenu)
+            lv = menu.query_one("#drive-action-list", ListView)
+            for item in lv.children:
+                act = getattr(item, "name", None)
+                if act == "drive_open":
+                    item.query_one(Label).update(f"  📂  Open {kind}")
+                elif act == "drive_trash":
+                    item.query_one(Label).update(f"  🗑   Trash {kind}")
+                elif act == "drive_archive":
+                    item.query_one(Label).update(f"  📦  Archive {kind}")
+        except Exception:
+            pass
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Handle clicking a year row to load per-year details."""
+        """Handle row selection on yearly table or drive inline table."""
+        if event.data_table.id == "drive-inline-table":
+            self._handle_drive_row_selected(event)
+            return
         if event.data_table.id != "yearly-table":
             return
         panel = self.query_one("#yearly-panel", YearlyPanel)
@@ -624,12 +1102,29 @@ class GmailManagerApp(App):
         action = event.item.name
         if action is None:
             return
+
+        # Drive actions
+        if action == "drive_refresh":
+            self._do_drive_refresh()
+            return
+        elif action == "drive_open":
+            self._drive_panel_open()
+            return
+        elif action == "drive_up":
+            self._drive_panel_up()
+            return
+        elif action == "drive_trash":
+            self._drive_panel_trash()
+            return
+        elif action == "drive_archive":
+            self._drive_panel_archive()
+            return
+
+        # Email actions
         yr = self.selected_year
         yr_label = f" from {yr}" if yr else ""
 
-        if action == "exit":
-            self.exit()
-        elif action == "refresh":
+        if action == "refresh":
             self.action_refresh()
         elif action == "spam":
             count = self.stats.get("Spam", {}).get("total", 0)
@@ -701,6 +1196,103 @@ class GmailManagerApp(App):
         else:
             self.status_msg("Refreshing statistics...")
             self._do_refresh()
+
+    def action_drive(self) -> None:
+        self._do_drive_refresh()
+
+    def _handle_drive_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle double-click / enter on drive inline table."""
+        panel = self.query_one("#drive-panel", DrivePanel)
+        row_key = str(event.row_key.value)
+        if row_key == "__go_up__":
+            panel.navigate_up()
+            return
+        for f in panel.folders:
+            if f["id"] == row_key:
+                if f.get("is_file"):
+                    panel.set_status(f"📄 '{f['name']}' is a file — use Trash/Archive actions")
+                else:
+                    panel.navigate_to(row_key, f["name"])
+                return
+
+    def _drive_panel_open(self) -> None:
+        panel = self.query_one("#drive-panel", DrivePanel)
+        item_id, name, is_file = panel.get_selected_item()
+        if item_id == "__go_up__":
+            panel.navigate_up()
+        elif is_file:
+            panel.set_status(f"📄 '{name}' is a file — use Trash/Archive actions")
+        elif item_id and name:
+            panel.navigate_to(item_id, name)
+
+    def _drive_panel_up(self) -> None:
+        panel = self.query_one("#drive-panel", DrivePanel)
+        if panel.nav_stack:
+            panel.navigate_up()
+
+    def _drive_panel_trash(self) -> None:
+        panel = self.query_one("#drive-panel", DrivePanel)
+        item_id, name, is_file = panel.get_selected_item()
+        if item_id == "__go_up__":
+            panel.set_status("⬆ Navigate up — nothing to trash here")
+            return
+        if not item_id:
+            panel.set_status("Select an item first")
+            return
+        kind = "file" if is_file else "folder"
+        size = next((f["size_formatted"] for f in panel.folders if f["id"] == item_id), "")
+        self.push_screen(
+            ConfirmDialog(f"🗑  Move {kind} '{name}' ({size}) to trash?"),
+            lambda result, fid=item_id, fn=name: self._do_drive_trash(fid, fn) if result else None,
+        )
+
+    def _drive_panel_archive(self) -> None:
+        panel = self.query_one("#drive-panel", DrivePanel)
+        item_id, name, is_file = panel.get_selected_item()
+        if item_id == "__go_up__":
+            panel.set_status("⬆ Navigate up — nothing to archive here")
+            return
+        if not item_id:
+            panel.set_status("Select an item first")
+            return
+        kind = "file" if is_file else "folder"
+        size = next((f["size_formatted"] for f in panel.folders if f["id"] == item_id), "")
+        self.push_screen(
+            ConfirmDialog(f"📦 Archive {kind} '{name}' ({size})? Moves to Archive folder."),
+            lambda result, fid=item_id, fn=name: self._do_drive_archive(fid, fn) if result else None,
+        )
+
+    @work(thread=True)
+    def _do_drive_trash(self, folder_id: str, name: str) -> None:
+        panel = self.query_one("#drive-panel", DrivePanel)
+        self.call_from_thread(panel.set_status, f"Trashing '{name}'...")
+        try:
+            creds = get_credentials()
+            trash_drive_folder(creds, folder_id)
+            panel.folders = [f for f in panel.folders if f["id"] != folder_id]
+            self.call_from_thread(panel.display_folders)
+            self.call_from_thread(panel.set_status, f"✅ '{name}' trashed")
+        except Exception as e:
+            self.call_from_thread(panel.set_status, f"❌ Failed: {e}")
+
+    @work(thread=True)
+    def _do_drive_archive(self, folder_id: str, name: str) -> None:
+        panel = self.query_one("#drive-panel", DrivePanel)
+        self.call_from_thread(panel.set_status, f"Archiving '{name}'...")
+        try:
+            creds = get_credentials()
+            archive_drive_folder(creds, folder_id)
+            panel.folders = [f for f in panel.folders if f["id"] != folder_id]
+            self.call_from_thread(panel.display_folders)
+            self.call_from_thread(panel.set_status, f"✅ '{name}' archived")
+        except Exception as e:
+            self.call_from_thread(panel.set_status, f"❌ Failed: {e}")
+
+    @work(thread=True)
+    def _do_drive_refresh(self) -> None:
+        panel = self.query_one("#drive-panel", DrivePanel)
+        self.call_from_thread(panel.set_status, "Refreshing Drive...")
+        self._load_drive_inline()
 
     def action_yearly(self) -> None:
         self.status_msg("Refreshing yearly data...")

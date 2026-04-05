@@ -7,7 +7,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-SCOPES = ["https://mail.google.com/", "https://www.googleapis.com/auth/drive.metadata.readonly"]
+SCOPES = ["https://mail.google.com/", "https://www.googleapis.com/auth/drive"]
 TOKEN_PATH = os.path.join(os.path.dirname(__file__), "token.json")
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "credentials.json")
 
@@ -17,7 +17,13 @@ def authenticate():
     creds = None
 
     if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        # Check if stored token has all required scopes
+        with open(TOKEN_PATH, "r") as f:
+            token_data = json.load(f)
+        stored_scopes = set(token_data.get("scopes", []))
+        if set(SCOPES).issubset(stored_scopes):
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        # else: creds stays None → forces re-authentication for new scopes
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -42,7 +48,11 @@ def get_credentials():
     """Return the current OAuth2 credentials (refreshing if needed)."""
     creds = None
     if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        with open(TOKEN_PATH, "r") as f:
+            token_data = json.load(f)
+        stored_scopes = set(token_data.get("scopes", []))
+        if set(SCOPES).issubset(stored_scopes):
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     return creds
