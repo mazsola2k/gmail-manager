@@ -2,7 +2,7 @@
 
 A terminal-based Gmail manager that shows your mailbox statistics and helps you clean up emails.
 
-![alt text](image.png)
+![alt text](image-1.png)
 
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue)
 
@@ -13,7 +13,7 @@ A terminal-based Gmail manager that shows your mailbox statistics and helps you 
 - **Yearly breakdown** — visualize email volume by year with bar charts
 - **Year drill-down** — select a year to see per-category stats for that year
 - **Year-scoped actions** — all cleanup actions can target a specific year
-- **Google Drive folders** — list root-level Drive folders sorted by size with visual bars, archive or trash folders
+- **Google Drive browser** — inline panel showing all Drive files and folders sorted by size, with gauge bars and percentage of total usage
 - **Smart suggestions** — get cleanup recommendations based on your mailbox
 - **Cleanup actions:**
   - 🗑 Permanently delete spam
@@ -25,10 +25,12 @@ A terminal-based Gmail manager that shows your mailbox statistics and helps you 
   - ⏰ Trash emails older than N days
   - 📦 Trash large emails (>10MB)
   - 🔥 Empty trash (permanently delete trashed emails)
-- **Drive folder actions:**
-  - 📁 Browse root folders sorted by total size (descending)
-  - 🗑 Trash a folder
-  - 📦 Archive a folder (moves into an "Archive" folder in Drive root)
+- **Drive actions:**
+  - 📂 Browse folders and files with drill-down navigation
+  - 📊 Size gauge bars and percentage for each item
+  - 🗑 Trash any file or folder
+  - 📦 Archive any file or folder (moves into an "Archive" folder in Drive root)
+  - Dynamic action labels — menu says "Trash file" or "Trash folder" based on selection
 
 ## Prerequisites
 
@@ -58,7 +60,7 @@ A terminal-based Gmail manager that shows your mailbox statistics and helps you 
 
 ### Step 3: Enable the Google Drive API
 
-The Drive API is used to display your Google account storage quota (used / total).
+The Drive API is used to display your Google account storage quota and browse/manage Drive files and folders.
 
 1. Go back to **APIs & Services → Library**
 2. In the search bar, type **Google Drive API**
@@ -142,22 +144,26 @@ A `token.json` file is saved locally so you won't need to re-authorize on future
 
 ## Usage
 
-Once running, you'll see a split-pane Textual TUI with three panels:
+Once running, you'll see a split-pane Textual TUI with two columns:
 
-- **Left panel — Statistics & Yearly Breakdown:**
+- **Left pane — Email Statistics:**
   - A storage quota bar at the top showing used/total space (color-coded green → yellow → red)
   - Category breakdown (All Mail, Inbox, Promotions, Spam, etc.) with total and unread counts
   - Yearly breakdown with bar charts showing email volume per year
+  - Smart suggestions panel
+  - Email cleanup actions menu
 
-- **Right panel — Actions:**
-  - A list of cleanup actions (trash promotions, spam, inbox, sent, etc.)
-  - Select a year in the yearly panel to scope all actions to that year
-  - Select "✦ All" to return to the global view
+- **Right pane — Google Drive:**
+  - Breadcrumb navigation showing current path
+  - Files and folders listed by size (descending) with gauge bars and percentages
+  - 📂 folders with subfolders, 📁 leaf folders, 📄 files — each showing size and usage proportion
+  - Drill-down into folders by selecting them (Enter)
+  - Drive actions menu (Open, Trash, Archive) with labels that update dynamically (file vs folder)
 
 - **Navigation:**
   - Use **arrow keys** or **mouse** to navigate panels and select items
   - Press **Tab** to switch between panels
-  - Press **D** to open the Google Drive folder browser
+  - Press **D** to open the full-screen Google Drive browser modal
   - Every destructive action shows a confirmation dialog with clickable **Yes/No** buttons (or keyboard **Y/N**)
   - Press **Q** to quit
 
@@ -165,6 +171,7 @@ Once running, you'll see a split-pane Textual TUI with three panels:
 
 - All cleanup actions require **explicit confirmation** before executing
 - Most operations move emails to **Trash** (recoverable for 30 days in Gmail)
+- Drive trash/archive actions also require confirmation, showing item name and size
 - Only spam deletion and **Empty Trash** are **permanent** (uses Gmail's permanent delete API)
 - Statistics are refreshed automatically after each cleanup action
 
@@ -185,7 +192,9 @@ Once running, you'll see a split-pane Textual TUI with three panels:
 |------|---------|
 | `gmail_manager.py` | Main TUI application |
 | `auth.py` | OAuth2 authentication |
-| `gmail_ops.py` | Gmail API operations || `drive_ops.py` | Google Drive API operations || `credentials.json` | Your OAuth credentials **(do not commit!)** |
+| `gmail_ops.py` | Gmail API operations |
+| `drive_ops.py` | Google Drive API operations (file tree, trash, archive) |
+| `credentials.json` | Your OAuth credentials **(do not commit!)** |
 | `token.json` | Auto-generated auth token **(do not commit!)** |
 
 ## Architecture
@@ -202,8 +211,8 @@ Gmail Manager uses a **hybrid protocol model** — combining the Gmail REST API,
 | Trash/Spam counts by year | **IMAP** | Must select locale-specific folders (`\Trash`, `\Junk` attributes); REST labels don't support year-scoped counts |
 | Bulk move/delete emails | **Gmail REST API** | `batchModify` handles up to 1000 messages per call |
 | Storage quota | **Drive API v3** | Gmail API doesn't expose account storage; Drive's `about.get` does |
-| Drive folder sizes | **Drive API v3** | `files.list` fetches all files; sizes computed via in-memory parent tree |
-| Trash/archive folders | **Drive API v3** | `files.update` to trash or reparent folders |
+| Drive folder/file sizes | **Drive API v3** | `files.list` fetches all files; sizes computed via in-memory parent tree |
+| Trash/archive files & folders | **Drive API v3** | `files.update` to trash or reparent items |
 
 ### High-Level Component Diagram
 
@@ -223,10 +232,16 @@ graph TB
         DRIVE["<b>Drive API v3</b><br/>get_storage_quota()"]
     end
 
+    subgraph driveops["drive_ops.py — Drive Operations"]
+        direction TB
+        DTREE["<b>DriveTree</b><br/>get_children()<br/>compute_size()"]
+        DACT["<b>Drive Actions</b><br/>trash_drive_item()<br/>archive_drive_item()"]
+    end
+
     subgraph google["Google Services"]
         GMAIL_API["Gmail API v1<br/>REST endpoints"]
         IMAP_SRV["imap.gmail.com<br/>IMAP4_SSL + XOAUTH2"]
-        DRIVE_API["Drive API v3<br/>about.get"]
+        DRIVE_API["Drive API v3<br/>about.get, files.list,<br/>files.update"]
     end
 
     TUI --> AUTH
@@ -234,9 +249,13 @@ graph TB
     AUTH --> REST
     CREDS --> IMAP
     CREDS --> DRIVE
+    CREDS --> DTREE
+    CREDS --> DACT
     REST --> GMAIL_API
     IMAP --> IMAP_SRV
     DRIVE --> DRIVE_API
+    DTREE --> DRIVE_API
+    DACT --> DRIVE_API
 ```
 
 ### Protocol Flow — Statistics vs Actions
@@ -256,6 +275,7 @@ flowchart LR
         A1["Trash emails<br/><i>REST API: batchModify<br/>up to 1000 IDs/call</i>"]
         A2["Delete spam<br/><i>REST API: messages.delete<br/>(permanent)</i>"]
         A3["Empty trash<br/><i>REST API: messages.delete<br/>(permanent)</i>"]
+        A4["Trash/Archive Drive items<br/><i>Drive API: files.update</i>"]
     end
 
     subgraph refresh["🔄 Post-Action Refresh"]
@@ -318,6 +338,9 @@ sequenceDiagram
 | gmail_ops.py | `trash_*()` (all variants) | Gmail REST API |
 | gmail_ops.py | `permanently_delete_trash()` | Gmail REST API (messages.delete) |
 | gmail_ops.py | `_connect_imap()` | IMAP + REST API (profile lookup) |
+| drive_ops.py | `DriveTree.get_children()` | Drive API v3 (in-memory tree) |
+| drive_ops.py | `trash_drive_item()` | Drive API v3 (files.update) |
+| drive_ops.py | `archive_drive_item()` | Drive API v3 (files.update) |
 
 ## Security
 
